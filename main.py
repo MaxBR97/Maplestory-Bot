@@ -20,11 +20,11 @@ ACTIONS = ['left', 'right', 'up', 'down', 'alt', 'ctrl','idle']
 CHARACTER_TEMPLATES_DIR = Path("objects/My_Character")
 MONSTER_TEMPLATES_DIR = Path("Objects/Monsters")
 
-MATCH_THRESHOLD = 0.5
+MONSTER_MATCH_THRESHOLD = 0.55
 CHARACTER_MATCH_THRESHOLD = 0.5
 WINDOW_NAME = "MapleStory Detections"
 NOTICE_TEMPLATES_DIR = Path("Objects/Notice")
-NOTICE_MATCH_THRESHOLD = 0.35
+NOTICE_MATCH_THRESHOLD = 0.4
 EASY_OCR_READER = easyocr.Reader(["en"], gpu=False)
 BAR_TEMPLATES_DIR = Path("Objects/Bars")
 BAR_MATCH_THRESHOLD = 0.5
@@ -94,7 +94,7 @@ def detect_monsters(sct):
         if h > gray.shape[0] or w > gray.shape[1]:
             continue
         res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-        ys, xs = np.where(res >= MATCH_THRESHOLD)
+        ys, xs = np.where(res >= MONSTER_MATCH_THRESHOLD)
         for y, x in zip(ys, xs):
             center = (int(x + w / 2), int(y + h / 2))
             if any(np.hypot(center[0] - m[0], center[1] - m[1]) < 20 for m in monsters):
@@ -250,7 +250,7 @@ with mss() as sct:
         while True:
             coords = get_player_coords(sct)
             monsters = detect_monsters(sct)
-            notices = detect_notices(sct)
+            notices = []#detect_notices(sct)
             bars = detect_bars(sct)
             bars_summary = {cat: items[0]["text"] for cat, items in bars.items() if items}
             captured = np.array(sct.grab(SCREEN))
