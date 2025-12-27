@@ -22,6 +22,7 @@ MONSTER_TEMPLATES_DIR = Path("Objects/Monsters")
 
 MONSTER_MATCH_THRESHOLD = 0.55
 CHARACTER_MATCH_THRESHOLD = 0.5
+ATTACK_RANGE_X = 40  # Horizontal pixel distance to start attacking
 WINDOW_NAME = "MapleStory Detections"
 NOTICE_TEMPLATES_DIR = Path("Objects/Notice")
 NOTICE_MATCH_THRESHOLD = 0.4
@@ -213,13 +214,64 @@ def detect_bars(sct):
             bars[category] = parsed_texts
     return bars
 
-def perform_random_action():
-    #action = random.choice(ACTIONS)
-    action = 'idle' 
-    if action != "idle":
-        pydirectinput.press(action)
+def decide_action(player_coords, monsters):
+    """Decides the next set of actions based on game state."""
+    if not player_coords or not monsters:
+        return ['idle']
+
+    player_x, player_y = player_coords
+
+    # Find the closest monster
+    closest_monster = min(monsters, key=lambda m: np.hypot(m[0] - player_x, m[1] - player_y))
+    monster_x, monster_y = closest_monster
+
+    actions = []
+    # Determine direction relative to the monster
+    if monster_x < player_x:
+        direction = 'left'
+    else:
+        direction = 'right'
+
+    # 1. Attack if in range
+    if abs(monster_x - player_x) < ATTACK_RANGE_X:
+        actions.append(direction)
+        actions.append('ctrl')
+    # 2. Move towards the monster
+    else:
+        actions.append(direction)
     
-    return action
+    return actions if actions else ['idle']
+
+def perform_action(next_actions, current_actions):
+    """Manages continuous key presses for a set of actions."""
+    next_actions_set = set(next_actions)
+    current_actions_set = set(current_actions)
+
+    keys_to_release = current_actions_set - next_actions_set
+    keys_to_press = next_actions_set - current_actions_set
+
+    for key in keys_to_release:
+        if key != 'idle':
+            pydirectinput.keyUp(key)
+
+    # Special handling for attack initiation
+    is_attacking_now = 'ctrl' in keys_to_press
+    direction_key = 'left' if 'left' in keys_to_press else 'right' if 'right' in keys_to_press else None
+
+    if is_attacking_now and direction_key:
+        pydirectinput.keyDown(direction_key) # Press direction first
+        time.sleep(0.01) # Wait 10ms
+        pydirectinput.keyDown('ctrl') # Then press attack
+        # Remove them from the set so they aren't pressed again
+        keys_to_press.discard(direction_key)
+        keys_to_press.discard('ctrl')
+
+    # Press any remaining keys
+    for key in keys_to_press:
+        if key != 'idle':
+            pydirectinput.keyDown(key)
+            
+    return next_actions
 
 def annotate_frame(frame, player_coord, monsters, bars):
     annotated = frame.copy()
@@ -247,20 +299,24 @@ cv2.moveWindow(WINDOW_NAME, 800, 0)
 
 with mss() as sct:
     try:
+        current_actions = ['idle']
         while True:
             coords = get_player_coords(sct)
             monsters = detect_monsters(sct)
             notices = []#detect_notices(sct)
-            bars = detect_bars(sct)
+            bars = {}#detect_bars(sct)
             bars_summary = {cat: items[0]["text"] for cat, items in bars.items() if items}
             captured = np.array(sct.grab(SCREEN))
             display_frame = cv2.cvtColor(captured, cv2.COLOR_BGRA2BGR)
 
-            last_action = perform_random_action()
+            # Decide and perform the next action
+            next_actions = decide_action(coords, monsters)
+            current_actions = perform_action(next_actions, current_actions)
+
             coord_str = f"({coords[0]}, {coords[1]})" if coords else "Not Found"
             print(
                 f"Time: {time.strftime('%H:%M:%S')} | Char: {coord_str} | "
-                f"Monsters: {monsters} | Notices: {notices} | Bars: {bars_summary} | Action: {last_action}"
+                f"Monsters: {len(monsters)} | Notices: {notices} | Bars: {bars_summary} | Action: {current_actions}"
             )
 
             annotated = annotate_frame(display_frame, coords, monsters, bars)
@@ -270,9 +326,13 @@ with mss() as sct:
             if cv2.waitKey(1) & 0xFF == 27:
                 break
 
-            time.sleep(random.uniform(0.1, 0.35))
+            time.sleep(random.uniform(0.1, 0.15))
 
     except KeyboardInterrupt:
         print("\nStopping Agent.")
     finally:
+        # Ensure all keys are released on exit
+        for key in ACTIONS:
+            if key != 'idle':
+                pydirectinput.keyUp(key)
         cv2.destroyAllWindows()
