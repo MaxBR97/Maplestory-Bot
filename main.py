@@ -8,15 +8,18 @@ import os
 from pathlib import Path
 import pytesseract
 import easyocr
+import re
 
 # --- CONFIGURATION ---
 # Adjust these to match your Mini-map location
 #MAP_REGION = {"top": 40, "left": 15, "width": 150, "height":150 }
-SCREEN = {"top": 0, "left": 0, "width": 800, "height": 640}
+SCREEN = {"top": 0, "left": 0, "width": 800, "height": 625}
+BAR_REGION = {"top": 590, "left": 0, "width": 560, "height": 35}
 
 ACTIONS = ['left', 'right', 'up', 'down', 'alt', 'ctrl','idle']
 GREEN_SNAIL_DIR = Path("objects/monsters/green_snail")
 CHARACTER_TEMPLATES_DIR = Path("objects/My_Character")
+
 MATCH_THRESHOLD = 0.5
 CHARACTER_MATCH_THRESHOLD = 0.5
 WINDOW_NAME = "MapleStory Detections"
@@ -24,7 +27,14 @@ NOTICE_TEMPLATES_DIR = Path("Objects/Notice")
 NOTICE_MATCH_THRESHOLD = 0.5
 EASY_OCR_READER = easyocr.Reader(["en"], gpu=False)
 BAR_TEMPLATES_DIR = Path("Objects/Bars")
-BAR_MATCH_THRESHOLD = 0.5
+BAR_MATCH_THRESHOLD = 0.3
+
+BAR_PATTERNS = {
+    "Level": re.compile(r"\b(\d{1,3})\b"),
+    "HP": re.compile(r"\[(\d+/\d+)\]"),
+    "MP": re.compile(r"\[(\d+/\d+)\]"),
+    "EXP": re.compile(r"(\d+(?:\.\d+)?)"),
+}
 
 def load_templates(directory):
     templates = []
@@ -86,20 +96,31 @@ def detect_notices(sct):
     img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    notices = []
+    matches = []
     for template, (w, h) in NOTICE_TEMPLATES:
+        if h > gray.shape[0] or w > gray.shape[1]:
+            continue
         res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
         ys, xs = np.where(res >= NOTICE_MATCH_THRESHOLD)
         for y, x in zip(ys, xs):
             snippet = gray[y : y + h, x : x + w]
-            parsed = EASY_OCR_READER.readtext(snippet, detail=0, allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789()+ ")
+            parsed = EASY_OCR_READER.readtext(
+                snippet, detail=0, allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789()+ "
+            )
             text = " ".join(item.strip() for item in parsed if item.strip())
             if text:
-                notices.append(text)
-    return notices
+                matches.append({"text": text, "rect": (x, y, w, h)})
+    return matches
+
+def normalize_bar_text(category, candidate):
+    pattern = BAR_PATTERNS.get(category)
+    if not pattern:
+        return None
+    match = pattern.search(candidate)
+    return match.group(1) if match else None
 
 def detect_bars(sct):
-    monitor = sct.grab(SCREEN)
+    monitor = sct.grab(BAR_REGION)
     img = np.array(monitor)
     img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -107,17 +128,29 @@ def detect_bars(sct):
     bars = {}
     for category, templates in BAR_TEMPLATES.items():
         parsed_texts = []
+        seen_centers = []
+        found = False
         for template, (w, h) in templates:
+            if found or h > gray.shape[0] or w > gray.shape[1]:
+                continue
             res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
             ys, xs = np.where(res >= BAR_MATCH_THRESHOLD)
             for y, x in zip(ys, xs):
                 snippet = gray[y : y + h, x : x + w]
                 parsed = EASY_OCR_READER.readtext(
-                    snippet, detail=0, allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./% "
+                    snippet, detail=0, allowlist="0123456789.%[] "
                 )
                 text = " ".join(item.strip() for item in parsed if item.strip())
-                if text:
-                    parsed_texts.append(text)
+                normalized = normalize_bar_text(category, text)
+                if not normalized:
+                    continue
+                center = (x + w // 2, y + h // 2)
+                if any(np.hypot(center[0] - c[0], center[1] - c[1]) < 8 for c in seen_centers):
+                    continue
+                seen_centers.append(center)
+                parsed_texts.append({"text": normalized, "rect": (x, y, w, h)})
+                found = True
+                break
         if parsed_texts:
             bars[category] = parsed_texts
     return bars
@@ -130,12 +163,24 @@ def perform_random_action():
     
     return action
 
-def annotate_frame(frame, player_coord, monsters):
+def annotate_frame(frame, player_coord, monsters, notices, bars):
     annotated = frame.copy()
     if player_coord:
         cv2.circle(annotated, player_coord, 12, (255, 0, 0), 2)
     for m in monsters:
         cv2.drawMarker(annotated, m, (0, 255, 0), cv2.MARKER_TILTED_CROSS, 20, 2)
+    for notice in notices:
+        x, y, w, h = notice["rect"]
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), (255, 255, 0), 2)
+    for items in bars.values():
+        for item in items:
+            x, y, w, h = item["rect"]
+            top_left = (x + BAR_REGION["left"], y + BAR_REGION["top"])
+            bottom_right = (
+                x + BAR_REGION["left"] + w,
+                y + BAR_REGION["top"] + h,
+            )
+            cv2.rectangle(annotated, top_left, bottom_right, (0, 255, 255), 2)
     return annotated
 
 # --- MAIN LOOP ---
@@ -152,6 +197,7 @@ with mss() as sct:
             monsters = detect_monsters(sct)
             notices =  []#detect_notices(sct)
             bars = detect_bars(sct)
+            bars_summary = {cat: items[0]["text"] for cat, items in bars.items() if items}
             captured = np.array(sct.grab(SCREEN))
             display_frame = cv2.cvtColor(captured, cv2.COLOR_BGRA2BGR)
 
@@ -159,17 +205,17 @@ with mss() as sct:
             coord_str = f"({coords[0]}, {coords[1]})" if coords else "Not Found"
             print(
                 f"Time: {time.strftime('%H:%M:%S')} | Char: {coord_str} | "
-                f"Monsters: {monsters} | Notices: {notices} | Bars: {bars} | Action: {last_action}"
+                f"Monsters: {monsters} | Notices: {notices} | Bars: {bars_summary} | Action: {last_action}"
             )
 
-            annotated = annotate_frame(display_frame, coords, monsters)
+            annotated = annotate_frame(display_frame, coords, monsters, notices, bars)
 
             window_rect = cv2.getWindowImageRect(WINDOW_NAME)
             cv2.imshow(WINDOW_NAME, annotated)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
 
-            time.sleep(random.uniform(0.33, 1.12))
+            time.sleep(random.uniform(1.33, 1.62))
 
     except KeyboardInterrupt:
         print("\nStopping Agent.")
