@@ -16,13 +16,15 @@ SCREEN = {"top": 0, "left": 0, "width": 800, "height": 625}
 BAR_REGION = {"top": 590, "left": 0, "width": 560, "height": 35}
 NOTICE_REGION = {"top": 370, "left": 500, "width": 300, "height": 110}
 
-ACTIONS = ['left', 'right', 'up', 'down', 'alt', 'ctrl','idle']
+ACTIONS = ['left', 'right', 'up', 'down', 'alt', 'ctrl','idle', 'space', 'Home', 'End']
 CHARACTER_TEMPLATES_DIR = Path("objects/My_Character")
 MONSTER_TEMPLATES_DIR = Path("Objects/Monsters")
 
-MONSTER_MATCH_THRESHOLD = 0.55
+MONSTER_MATCH_THRESHOLD = 0.65
 CHARACTER_MATCH_THRESHOLD = 0.5
-ATTACK_RANGE_X = 40  # Horizontal pixel distance to start attacking
+ATTACK_RANGE_X = 250
+ATTACK_RANGE_Y = 80 # Vertical distance to engage monsters
+ATTACK_KEYS = {'ctrl', 'space'} # Define all possible attack keys here
 WINDOW_NAME = "MapleStory Detections"
 NOTICE_TEMPLATES_DIR = Path("Objects/Notice")
 NOTICE_MATCH_THRESHOLD = 0.4
@@ -67,6 +69,47 @@ BAR_TEMPLATES = {
     if category.is_dir()
 }
 MONSTER_TEMPLATES = load_templates_recursive(MONSTER_TEMPLATES_DIR)
+
+def check_hp_status(sct):
+    """Checks a single pixel to see if HP is low (grey) or high (red)."""
+    # Define the single pixel region to check
+    hp_pixel_region = {"top": 615, "left": 270, "width": 1, "height": 1}
+    
+    # Grab the pixel
+    img = np.array(sct.grab(hp_pixel_region))
+    
+    # Convert from BGRA to BGR, then to HSV
+    bgr_img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    hsv_pixel = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)[0, 0]
+    
+    hue, saturation, value = hsv_pixel
+    
+    # Grey colors have very low saturation.
+    # If saturation is low, we assume the bar is depleted.
+    is_grey = saturation < 30 and value > 50
+    
+    # As requested: returns True if grey (HP needed), False if red.
+    return is_grey
+
+def check_mp_status(sct):
+    """Checks a single pixel to see if MP is low (grey) or high (blue)."""
+    # Define the single pixel region to check
+    mp_pixel_region = {"top": 615, "left": 350, "width": 1, "height": 1}
+    
+    # Grab the pixel
+    img = np.array(sct.grab(mp_pixel_region))
+    
+    # Convert from BGRA to BGR, then to HSV
+    bgr_img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    hsv_pixel = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)[0, 0]
+    
+    hue, saturation, value = hsv_pixel
+    
+    # Grey colors have very low saturation.
+    is_grey = saturation < 30 and value > 50
+    
+    # Returns True if grey (MP needed), False if blue.
+    return is_grey
 
 def get_player_coords(sct):
     monitor = sct.grab(SCREEN)
@@ -214,18 +257,33 @@ def detect_bars(sct):
             bars[category] = parsed_texts
     return bars
 
-def decide_action(player_coords, monsters):
+def decide_action(player_coords, monsters, need_HP, need_MP):
     """Decides the next set of actions based on game state."""
-    if not player_coords or not monsters:
+    actions = []
+    if need_HP:
+        actions.append('Home')
+    if need_MP:
+        actions.append('End')
+
+    # If using a potion, don't do anything else for this cycle
+    if actions:
+        return actions
+
+    if not player_coords:
         return ['idle']
 
     player_x, player_y = player_coords
 
-    # Find the closest monster
-    closest_monster = min(monsters, key=lambda m: np.hypot(m[0] - player_x, m[1] - player_y))
+    # Filter monsters to only include those within vertical reach
+    reachable_monsters = [m for m in monsters if abs(m[1] - player_y) < ATTACK_RANGE_Y]
+
+    if not reachable_monsters:
+        return ['idle']
+
+    # Find the closest monster from the reachable list
+    closest_monster = min(reachable_monsters, key=lambda m: np.hypot(m[0] - player_x, m[1] - player_y))
     monster_x, monster_y = closest_monster
 
-    actions = []
     # Determine direction relative to the monster
     if monster_x < player_x:
         direction = 'left'
@@ -235,7 +293,7 @@ def decide_action(player_coords, monsters):
     # 1. Attack if in range
     if abs(monster_x - player_x) < ATTACK_RANGE_X:
         actions.append(direction)
-        actions.append('ctrl')
+        actions.append('space') # Or 'ctrl', depending on which attack you want
     # 2. Move towards the monster
     else:
         actions.append(direction)
@@ -244,32 +302,24 @@ def decide_action(player_coords, monsters):
 
 def perform_action(next_actions, current_actions):
     """Manages continuous key presses for a set of actions."""
+    # If the action hasn't changed, do nothing and return.
+
     next_actions_set = set(next_actions)
     current_actions_set = set(current_actions)
 
-    keys_to_release = current_actions_set - next_actions_set
-    keys_to_press = next_actions_set - current_actions_set
-
-    for key in keys_to_release:
+    for key in current_actions:
         if key != 'idle':
             pydirectinput.keyUp(key)
 
-    # Special handling for attack initiation
-    is_attacking_now = 'ctrl' in keys_to_press
-    direction_key = 'left' if 'left' in keys_to_press else 'right' if 'right' in keys_to_press else None
+    time.sleep(random.uniform(0.01, 0.03))
 
-    if is_attacking_now and direction_key:
-        pydirectinput.keyDown(direction_key) # Press direction first
-        time.sleep(0.01) # Wait 10ms
-        pydirectinput.keyDown('ctrl') # Then press attack
-        # Remove them from the set so they aren't pressed again
-        keys_to_press.discard(direction_key)
-        keys_to_press.discard('ctrl')
-
-    # Press any remaining keys
-    for key in keys_to_press:
+    for key in next_actions:
         if key != 'idle':
-            pydirectinput.keyDown(key)
+            if key == 'Home' or key == 'End':
+                pydirectinput.press(key)
+            else:
+                pydirectinput.keyDown(key)
+                time.sleep(random.uniform(0.01, 0.02))
             
     return next_actions
 
@@ -309,8 +359,12 @@ with mss() as sct:
             captured = np.array(sct.grab(SCREEN))
             display_frame = cv2.cvtColor(captured, cv2.COLOR_BGRA2BGR)
 
+            # Check HP and MP status
+            need_hp = check_hp_status(sct)
+            need_mp = check_mp_status(sct)
+
             # Decide and perform the next action
-            next_actions = decide_action(coords, monsters)
+            next_actions = decide_action(coords, monsters, need_hp, need_mp)
             current_actions = perform_action(next_actions, current_actions)
 
             coord_str = f"({coords[0]}, {coords[1]})" if coords else "Not Found"
@@ -326,7 +380,7 @@ with mss() as sct:
             if cv2.waitKey(1) & 0xFF == 27:
                 break
 
-            time.sleep(random.uniform(0.1, 0.15))
+            time.sleep(random.uniform(0.15, 0.25))
 
     except KeyboardInterrupt:
         print("\nStopping Agent.")
