@@ -18,7 +18,9 @@ NOTICE_REGION = {"top": 370, "left": 500, "width": 300, "height": 110}
 
 ACTIONS = ['left', 'right', 'up', 'down', 'alt', 'ctrl','idle', 'space', 'Home', 'End']
 CHARACTER_TEMPLATES_DIR = Path("objects/My_Character")
+CHARACTER_CLIMBING_TEMPLATES_DIR = Path("objects/My_Character/Climbing") # New
 MONSTER_TEMPLATES_DIR = Path("Objects/Monsters")
+CLIMBING_TEMPLATES_DIR = Path("Objects/Climbing")
 
 MONSTER_MATCH_THRESHOLD = 0.65
 CHARACTER_MATCH_THRESHOLD = 0.5
@@ -39,6 +41,26 @@ BAR_PATTERNS = {
     "EXP": re.compile(r"(\d+(?:\.\d+)?)"),
 }
 
+def load_player_templates(base_dir, climbing_dir):
+    """Loads all player templates and tags them as climbing or not."""
+    templates = []
+    # Load normal templates from the base directory
+    for entry in sorted(base_dir.iterdir()):
+        if entry.is_file() and entry.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
+            tpl = cv2.imread(str(entry), cv2.IMREAD_GRAYSCALE)
+            if tpl is not None:
+                # Tag: is_climbing = False
+                templates.append((tpl, tpl.shape[::-1], False))
+    
+    # Load climbing templates recursively from the climbing subdirectory
+    for entry in sorted(climbing_dir.rglob("*")):
+        if entry.is_file() and entry.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
+            tpl = cv2.imread(str(entry), cv2.IMREAD_GRAYSCALE)
+            if tpl is not None:
+                # Tag: is_climbing = True
+                templates.append((tpl, tpl.shape[::-1], True))
+    return templates
+
 def load_templates(directory):
     templates = []
     for entry in sorted(directory.iterdir()):
@@ -47,21 +69,21 @@ def load_templates(directory):
         tpl = cv2.imread(str(entry), cv2.IMREAD_GRAYSCALE)
         if tpl is None:
             continue
-        templates.append((tpl, tpl.shape[::-1]))  # (template, (width,height))
-    return templates
-
-def load_templates_recursive(directory):
-    templates = []
-    for entry in sorted(directory.rglob("*")):
-        if not entry.is_file() or entry.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
-            continue
-        tpl = cv2.imread(str(entry), cv2.IMREAD_GRAYSCALE)
-        if tpl is None:
-            continue
         templates.append((tpl, tpl.shape[::-1]))
     return templates
 
-PLAYER_TEMPLATES = load_templates(CHARACTER_TEMPLATES_DIR)
+def load_templates_recursive(directory):
+    """Recursively loads all image templates from a directory and its subdirectories."""
+    templates = []
+    for entry in sorted(directory.rglob("*")):
+        if entry.is_file() and entry.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
+            tpl = cv2.imread(str(entry), cv2.IMREAD_GRAYSCALE)
+            if tpl is None:
+                continue
+            templates.append((tpl, tpl.shape[::-1]))
+    return templates
+
+PLAYER_TEMPLATES = load_player_templates(CHARACTER_TEMPLATES_DIR, CHARACTER_CLIMBING_TEMPLATES_DIR)
 NOTICE_TEMPLATES = load_templates(NOTICE_TEMPLATES_DIR)
 BAR_TEMPLATES = {
     category.name: load_templates(category)
@@ -69,6 +91,7 @@ BAR_TEMPLATES = {
     if category.is_dir()
 }
 MONSTER_TEMPLATES = load_templates_recursive(MONSTER_TEMPLATES_DIR)
+CLIMBING_TEMPLATES = load_templates_recursive(CLIMBING_TEMPLATES_DIR) # New
 
 def check_hp_status(sct):
     """Checks a single pixel to see if HP is low (grey) or high (red)."""
@@ -111,21 +134,35 @@ def check_mp_status(sct):
     # Returns True if grey (MP needed), False if blue.
     return is_grey
 
-def get_player_coords(sct):
+def get_player_state(sct):
+    """
+    Finds the player on screen, returning their coordinates and climbing status.
+    It checks all player templates (normal and climbing) and finds the single best match.
+    """
     monitor = sct.grab(SCREEN)
     img = np.array(monitor)
     gray = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGRA2BGR), cv2.COLOR_BGR2GRAY)
 
-    best_center = None
     best_score = CHARACTER_MATCH_THRESHOLD
-    for template, (w, h) in PLAYER_TEMPLATES:
+    best_match = None # Will store (coords, is_climbing_state)
+
+    for template, (w, h), is_climbing_template in PLAYER_TEMPLATES:
+        if h > gray.shape[0] or w > gray.shape[1]:
+            continue
+        
         res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        
         if max_val > best_score:
             best_score = max_val
-            best_center = (int(max_loc[0] + w / 2), int(max_loc[1] + h / 2))
+            coords = (int(max_loc[0] + w / 2), int(max_loc[1] + h / 2))
+            best_match = (coords, is_climbing_template)
 
-    return best_center
+    if best_match:
+        print(best_match, " score: " ,best_score)
+        return best_match # Returns (coords, is_climbing)
+    else:
+        return (None, False) # Player not found
 
 def detect_monsters(sct):
     monitor = sct.grab(SCREEN)
@@ -146,6 +183,25 @@ def detect_monsters(sct):
             monsters.append(center)
 
     return monsters
+
+def detect_climbing_objects(sct):
+    """Detects ropes and ladders on the screen."""
+    monitor = sct.grab(SCREEN)
+    img = np.array(monitor)
+    gray = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGRA2BGR), cv2.COLOR_BGR2GRAY)
+
+    climbing_objects = []
+    for template, (w, h) in CLIMBING_TEMPLATES:
+        if h > gray.shape[0] or w > gray.shape[1]:
+            continue
+        res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+        ys, xs = np.where(res >= 0.7) # Using a slightly higher threshold for static objects
+        for y, x in zip(ys, xs):
+            center = (int(x + w / 2), int(y + h / 2))
+            # De-duplicate
+            if not any(np.hypot(center[0] - c[0], center[1] - c[1]) < 20 for c in climbing_objects):
+                climbing_objects.append(center)
+    return climbing_objects
 
 def preprocess_for_ocr(snippet):
     if snippet.size == 0:
@@ -257,70 +313,113 @@ def detect_bars(sct):
             bars[category] = parsed_texts
     return bars
 
-def decide_action(player_coords, monsters, need_HP, need_MP):
-    """Decides the next set of actions based on game state."""
-    actions = []
+def decide_action(player_coords, monsters, climbing_objects, is_climbing, need_HP, need_MP):
+    """Decides the next set of actions based on game state, including climbing."""
     if need_HP:
-        actions.append('Home')
+        return ['Home']
     if need_MP:
-        actions.append('End')
+        return ['End']
 
-    # If using a potion, don't do anything else for this cycle
-    if actions:
-        return actions
-
-    if not player_coords:
+    if not player_coords or not monsters:
         return ['idle']
 
     player_x, player_y = player_coords
+    target_monster = min(monsters, key=lambda m: np.hypot(m[0] - player_x, m[1] - player_y))
+    monster_x, monster_y = target_monster
 
-    # Filter monsters to only include those within vertical reach
-    reachable_monsters = [m for m in monsters if abs(m[1] - player_y) < ATTACK_RANGE_Y]
+    # --- NEW: Climbing State Logic ---
+    if is_climbing:
+        if monster_y < player_y:
+            return ['up'] # Monster is above, keep climbing up
+        else:
+            return ['down'] # Monster is below, climb down
 
-    if not reachable_monsters:
-        return ['idle']
-
-    # Find the closest monster from the reachable list
-    closest_monster = min(reachable_monsters, key=lambda m: np.hypot(m[0] - player_x, m[1] - player_y))
-    monster_x, monster_y = closest_monster
-
-    # Determine direction relative to the monster
-    if monster_x < player_x:
-        direction = 'left'
+    # --- Existing Pathfinding Logic ---
+    actions = []
+    #if random.uniform(0,1) > 0.5:
+    #    actions.append('z')
+    # Is the target monster on the same platform?
+    if abs(monster_y - player_y) < ATTACK_RANGE_Y:
+        # --- SAME PLATFORM LOGIC (Existing Logic) ---
+        if abs(monster_x - player_x) < ATTACK_RANGE_X:
+            # In attack range
+            direction = 'left' if monster_x < player_x else 'right'
+            actions.extend([direction, 'space'])
+        else:
+            # Out of attack range, move towards it
+            direction = 'left' if monster_x < player_x else 'right'
+            actions.append(direction)
     else:
-        direction = 'right'
+        # --- DIFFERENT PLATFORM LOGIC (New Climbing Logic) ---
+        # The monster is above or below. We need to find a rope/ladder.
+        if not climbing_objects:
+            return ['idle'] # No way to get there
 
-    # 1. Attack if in range
-    if abs(monster_x - player_x) < ATTACK_RANGE_X:
-        actions.append(direction)
-        actions.append('space') # Or 'ctrl', depending on which attack you want
-    # 2. Move towards the monster
-    else:
-        actions.append(direction)
+        # Find the closest climbing object to the player
+        closest_climb = min(climbing_objects, key=lambda c: np.hypot(c[0] - player_x, c[1] - player_y))
+        climb_x, climb_y = closest_climb
+
+        # 1. Align horizontally with the climbing object
+        if abs(player_x - climb_x) > 20: # Not aligned with the rope/ladder
+            # Move towards the rope/ladder
+            direction = 'left' if climb_x < player_x else 'right'
+            actions.append(direction)
+        else:
+            # 2. We are at the rope/ladder, now climb
+            if monster_y < player_y:
+                # Monster is above, climb up
+                actions.extend(['alt', 'up'])
+            else:
+                # Monster is below, climb down
+                actions.append('alt')
+                actions.append('down')
     
     return actions if actions else ['idle']
 
 def perform_action(next_actions, current_actions):
-    """Manages continuous key presses for a set of actions."""
-    # If the action hasn't changed, do nothing and return.
+    """
+    Manages continuous key presses efficiently. Re-presses attack keys to ensure continuous attacks.
+    """
+    if next_actions == 'idle' and random.uniform(0,1) > 0.9:
+        if random.uniform(0,1) > 0.5:
+            pydirectinput.keyDown('right')
+            return ['right']
+        else:
+            pydirectinput.keyDown('left')
+            return ['left']
+ 
 
+
+    # --- Handle Single-Press Actions (Potions) ---
+    if 'Home' in next_actions or 'End' in next_actions:
+        for key in current_actions:
+            if key != 'idle':
+                pydirectinput.keyUp(key)
+        for key in next_actions:
+            if key in ['Home', 'End']:
+                pydirectinput.press(key)
+        return ['idle']
+
+    # --- Handle Continuous Actions (Movement/Attack/Climbing) ---
     next_actions_set = set(next_actions)
     current_actions_set = set(current_actions)
 
-    for key in current_actions:
+    # 1. Release keys that are no longer needed.
+    keys_to_release = current_actions_set - next_actions_set
+    for key in keys_to_release:
         if key != 'idle':
             pydirectinput.keyUp(key)
-
-    time.sleep(random.uniform(0.01, 0.03))
-
+    
+    # 2. Handle pressing keys, with special logic for attacks.
     for key in next_actions:
-        if key != 'idle':
-            if key == 'Home' or key == 'End':
-                pydirectinput.press(key)
-            else:
-                pydirectinput.keyDown(key)
-                time.sleep(random.uniform(0.01, 0.02))
-            
+        # If the key is an attack key, always perform a quick press.
+        # This ensures the attack is re-triggered on every loop.
+        if key in ATTACK_KEYS or key == 'alt':
+            pydirectinput.press(key)
+        # If it's a movement/climbing key and it's NOT already held down, press it.
+        elif key not in current_actions_set and key != 'idle':
+            pydirectinput.keyDown(key)
+    
     return next_actions
 
 def annotate_frame(frame, player_coord, monsters, bars):
@@ -342,7 +441,6 @@ def annotate_frame(frame, player_coord, monsters, bars):
 
 # --- MAIN LOOP ---
 print("AI Agent Active. Focus the MapleStory window NOW!")
-#time.sleep(2)
 
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 cv2.moveWindow(WINDOW_NAME, 800, 0)
@@ -351,8 +449,11 @@ with mss() as sct:
     try:
         current_actions = ['idle']
         while True:
-            coords = get_player_coords(sct)
+            # Single call to get both player coordinates and climbing state
+            coords, is_climbing = get_player_state(sct)
+            
             monsters = detect_monsters(sct)
+            climbs = detect_climbing_objects(sct)
             notices = []#detect_notices(sct)
             bars = {}#detect_bars(sct)
             bars_summary = {cat: items[0]["text"] for cat, items in bars.items() if items}
@@ -364,10 +465,10 @@ with mss() as sct:
             need_mp = check_mp_status(sct)
 
             # Decide and perform the next action
-            next_actions = decide_action(coords, monsters, need_hp, need_mp)
+            next_actions = decide_action(coords, monsters, climbs, is_climbing, need_hp, need_mp)
             current_actions = perform_action(next_actions, current_actions)
 
-            coord_str = f"({coords[0]}, {coords[1]})" if coords else "Not Found"
+            coord_str = f"{'Climbing ' if is_climbing else ''}({coords[0]}, {coords[1]})" if coords else "Not Found"
             print(
                 f"Time: {time.strftime('%H:%M:%S')} | Char: {coord_str} | "
                 f"Monsters: {len(monsters)} | Notices: {notices} | Bars: {bars_summary} | Action: {current_actions}"
@@ -380,7 +481,7 @@ with mss() as sct:
             if cv2.waitKey(1) & 0xFF == 27:
                 break
 
-            time.sleep(random.uniform(0.15, 0.25))
+            time.sleep(random.uniform(0.04, 0.25))
 
     except KeyboardInterrupt:
         print("\nStopping Agent.")
