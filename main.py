@@ -360,7 +360,7 @@ def decide_action(player_coords, monsters, climbing_objects, is_climbing, need_H
         climb_x, climb_y = closest_climb
 
         # 1. Align horizontally with the climbing object
-        if abs(player_x - climb_x) > 20: # Not aligned with the rope/ladder
+        if abs(player_x - climb_x) > (random.random() * 40 + 6): # Not aligned with the rope/ladder
             # Move towards the rope/ladder
             direction = 'left' if climb_x < player_x else 'right'
             actions.append(direction)
@@ -380,16 +380,18 @@ def perform_action(next_actions, current_actions):
     """
     Manages continuous key presses efficiently. Re-presses attack keys to ensure continuous attacks.
     """
-    if next_actions == 'idle' and random.uniform(0,1) > 0.9:
-        if random.uniform(0,1) > 0.5:
-            pydirectinput.keyDown('right')
-            return ['right']
-        else:
-            pydirectinput.keyDown('left')
-            return ['left']
+    # --- Wandering Logic ---
+    # If the bot decides to be idle, there's a 40% chance it will move or jump down.
+    if next_actions == ['idle'] and random.random() < 0.2:
+        # Define the possible random actions
+        possible_wandering_actions = [
+            ['left'], 
+            ['right'], 
+            ['down', 'alt']
+        ]
+        # Randomly choose one of the defined actions
+        next_actions = random.choice(possible_wandering_actions)
  
-
-
     # --- Handle Single-Press Actions (Potions) ---
     if 'Home' in next_actions or 'End' in next_actions:
         for key in current_actions:
