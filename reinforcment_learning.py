@@ -1,4 +1,5 @@
 import os
+import sys
 
 import cv2
 import numpy as np
@@ -9,6 +10,12 @@ from mss import mss
 from pathlib import Path
 import easyocr
 import re
+from rl_agent import RLAgent, RLEnvironment, execute_action, action_idx_from_pressed_keys, action_idx_to_key_sequence
+
+try:
+    import keyboard
+except Exception:
+    keyboard = None
 
 # --- CONFIGURATION ---
 # Adjust these to match your Mini-map location
@@ -33,7 +40,7 @@ NOTICE_MATCH_THRESHOLD = 0.4
 EASY_OCR_READER = easyocr.Reader(["en"], gpu=False)
 BAR_TEMPLATES_DIR = Path("Objects/Bars")
 BAR_MATCH_THRESHOLD = 0.5
-DAMAGE_THRESHOLD = 0.5
+DAMAGE_THRESHOLD = 0.4
 BAR_PATTERNS = {
     "Level": re.compile(r"\b(\d{1,3})\b"),
     "HP": re.compile(r"\[(\d+/\d+)\]"),
@@ -42,6 +49,77 @@ BAR_PATTERNS = {
 }
 
 PERIODIC_ACTIONS = {"0": 180}  # key -> interval in seconds
+
+# --- RL HYPERPARAMETERS ---
+RL_STATE_DIM = 12
+RL_HIDDEN_DIM = 128
+RL_LEARNING_RATE = 0.1
+RL_GAMMA = 0.99
+RL_ENTROPY_COEF = 0.01
+UPDATE_INTERVAL = 256
+SLEEP_MIN_SECONDS = 0.10
+SLEEP_MAX_SECONDS = 0.30
+
+REWARD_CONFIG = {
+    "damage_reward": 10.0,
+    "step_penalty": 0.01,
+    "low_hp_penalty": 0.5,
+    "low_mp_penalty": 0.25,
+}
+
+def parse_cli_params(argv):
+    params = {}
+    for arg in argv[1:]:
+        if "=" not in arg:
+            continue
+        key, value = arg.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if value.lower() in {"true", "false"}:
+            parsed = value.lower() == "true"
+        else:
+            parsed = value
+            try:
+                parsed = int(value)
+            except ValueError:
+                try:
+                    parsed = float(value)
+                except ValueError:
+                    parsed = value
+        params[key] = parsed
+    return params
+
+class KeyStateTracker:
+    """Track which keys are currently held down (for observe mode)."""
+    def __init__(self):
+        self.held_keys = set()
+        if keyboard:
+            keyboard.on_press(self._on_key_press)
+            keyboard.on_release(self._on_key_release)
+    
+    def _on_key_press(self, event):
+        #print("pressed: ", event.name)
+        normalized = self._normalize_key(event.name)
+        if normalized:
+            self.held_keys.add(normalized)
+    
+    def _on_key_release(self, event):
+        #print("released: ", event.name)
+        normalized = self._normalize_key(event.name)
+        if normalized:
+            self.held_keys.discard(normalized)
+    
+    def _normalize_key(self, key_name):
+        """Normalize key name using aliases."""
+        from rl_agent import KEY_ALIASES
+        alias = KEY_ALIASES.get(str(key_name).lower(), str(key_name).lower())
+        #print("key_name: ", key_name, " normalized: ", alias)
+        return alias
+    
+    def get_held_keys(self):
+        ans = list(self.held_keys)
+        self.held_keys.clear()
+        return ans
 
 def load_player_templates(base_dir, climbing_dir):
     """Loads all player templates and tags them as climbing or not."""
@@ -206,22 +284,28 @@ def detect_climbing_objects(sct):
     return climbing_objects
 
 def detect_damage(sct):
-    """Detects damage numbers on the screen."""
+    """Detects damage numbers on the screen and returns count + positions."""
     monitor = sct.grab(SCREEN)
     img = np.array(monitor)
     gray = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGRA2BGR), cv2.COLOR_BGR2GRAY)
 
     damage_count = 0
+    damage_positions = []
     damage_templates = load_templates_recursive(Path("Objects/Damage"))
     
     for template, (w, h) in damage_templates:
         if h > gray.shape[0] or w > gray.shape[1]:
             continue
         res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-        ys, xs = np.where(res >= DAMAGE_THRESHOLD)  # Adjust threshold as needed
-        damage_count += len(ys)
+        ys, xs = np.where(res >= DAMAGE_THRESHOLD)
+        for y, x in zip(ys, xs):
+            center = (int(x + w / 2), int(y + h / 2))
+            # Avoid duplicate detections
+            if not any(np.hypot(center[0] - d[0], center[1] - d[1]) < 20 for d in damage_positions):
+                damage_positions.append(center)
+                damage_count += 1
     
-    return damage_count
+    return damage_count, damage_positions
 
 def preprocess_for_ocr(snippet):
     if snippet.size == 0:
@@ -388,68 +472,44 @@ def decide_action(player_coords, monsters, climbing_objects, is_climbing, need_H
             # 2. We are at the rope/ladder, now climb
             if monster_y < player_y:
                 # Monster is above, climb up
-                actions.extend(['alt', 'up'])
+                actions.extend(['alt','up'])
             else:
                 # Monster is below, climb down
-                actions.append('alt')
                 actions.append('down')
+                actions.append('alt')
     
     return actions if actions else ['idle']
 
-def perform_action(next_actions, current_actions):
+def perform_action_rl(agent, env, state_vector, current_actions, damage_count, training=True):
     """
-    Manages continuous key presses efficiently. Re-presses attack keys to ensure continuous attacks.
+    RL-based action selection and execution.
+    - agent: RLAgent instance
+    - env: RLEnvironment instance for reward computation
+    - state_vector: Continuous state representation
+    - current_actions: Currently held keys
+    - damage_count: Current damage dealt this episode
+    - training: Whether to train the network
     """
-    # --- Wandering Logic ---
-    # If the bot decides to be idle, there's a 40% chance it will move or jump down.
-    if next_actions == ['idle'] and random.random() < 0.2:
-        # Define the possible random actions
-        possible_wandering_actions = [
-            ['left'], 
-            ['right'], 
-            ['down', 'alt']
-        ]
-        # Randomly choose one of the defined actions
-        next_actions = random.choice(possible_wandering_actions)
- 
-    # --- Handle Single-Press Actions (Potions) ---
-    if 'Home' in next_actions or 'End' in next_actions:
-        for key in current_actions:
-            if key != 'idle':
-                pydirectinput.keyUp(key)
-        for key in next_actions:
-            if key in ['Home', 'End']:
-                pydirectinput.press(key)
-        return ['idle']
-
-    # --- Handle Continuous Actions (Movement/Attack/Climbing) ---
-    next_actions_set = set(next_actions)
-    current_actions_set = set(current_actions)
-
-    # 1. Release keys that are no longer needed.
-    keys_to_release = current_actions_set - next_actions_set
-    for key in keys_to_release:
-        if key != 'idle':
-            pydirectinput.keyUp(key)
+    # Select action using the RL policy
+    action_idx, action_probs, state_value = agent.select_action(state_vector, training=training)
     
-    # 2. Handle pressing keys, with special logic for attacks.
-    for key in next_actions:
-        # If the key is an attack key, always perform a quick press.
-        # This ensures the attack is re-triggered on every loop.
-        if key in ATTACK_KEYS or key == 'alt':
-            pydirectinput.press(key)
-        # If it's a movement/climbing key and it's NOT already held down, press it.
-        elif key not in current_actions_set and key != 'idle':
-            pydirectinput.keyDown(key)
+    # Execute the action
+    next_actions = execute_action(action_idx, current_actions)
     
-    return next_actions
+    return action_idx, next_actions, action_probs, state_value
 
-def annotate_frame(frame, player_coord, monsters, bars):
+def annotate_frame(frame, player_coord, monsters, bars, climbs=None, damages=None):
     annotated = frame.copy()
     if player_coord:
         cv2.circle(annotated, player_coord, 12, (255, 0, 0), 2)
     for m in monsters:
         cv2.drawMarker(annotated, m, (0, 255, 0), cv2.MARKER_TILTED_CROSS, 20, 2)
+    if climbs:
+        for c in climbs:
+            cv2.drawMarker(annotated, c, (255, 255, 0), cv2.MARKER_CROSS, 25, 2)
+    if damages:
+        for d in damages:
+            cv2.drawMarker(annotated, d, (0, 0, 255), cv2.MARKER_STAR, 20, 2)
     for items in bars.values():
         for item in items:
             x, y, w, h = item["rect"]
@@ -466,23 +526,66 @@ def init_periodic_schedule(actions):
     return {k: now + interval for k, interval in actions.items()}
 
 # --- MAIN LOOP ---
+params = parse_cli_params(sys.argv)
+observe_human = bool(
+    params.get("observe", False)
+    or params.get("observe_human", False)
+    or params.get("human", False)
+)
+
 print("AI Agent Active. Focus the MapleStory window NOW!")
+print("Initialize RL Agent and Environment...")
+if observe_human:
+    print("Human observe mode enabled: no inputs will be sent.")
+    if keyboard is None:
+        raise SystemExit("Human observe mode requires the 'keyboard' package.")
 
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 cv2.moveWindow(WINDOW_NAME, 800, 0)
+
+# Initialize key tracker if in observe mode
+key_tracker = None
+if observe_human:
+    key_tracker = KeyStateTracker()
+    print("Key state tracker initialized.")
+
+# Initialize RL components
+rl_agent = RLAgent(
+    state_dim=RL_STATE_DIM,
+    hidden_dim=RL_HIDDEN_DIM,
+    lr=RL_LEARNING_RATE,
+    gamma=RL_GAMMA,
+    entropy_coef=RL_ENTROPY_COEF,
+)
+rl_env = RLEnvironment(reward_config=REWARD_CONFIG)
+episode_count = 0
+update_interval = UPDATE_INTERVAL  # Update the network every N steps
+
+# Load existing model if available
+model_path = "rl_agent_model.pth"
+if Path(model_path).exists():
+    print(f"Loading existing model from {model_path}...")
+    rl_agent.load_model(model_path)
+else:
+    print("No existing model found. Starting training from scratch...")
 
 with mss() as sct:
     try:
         current_actions = ['idle']
         periodic_schedule = init_periodic_schedule(PERIODIC_ACTIONS)
+        total_steps = 0
+        episode_reward = 0
+        
         while True:
             now_ts = time.time()
-            # fire periodic keys
-            for key, due in periodic_schedule.items():
-                if now_ts >= due:
-                    pydirectinput.press(key)
-                    periodic_schedule[key] = now_ts + PERIODIC_ACTIONS[key]
+            # fire periodic keys (bot mode only)
+            if not observe_human:
+                for key, due in periodic_schedule.items():
+                    if now_ts >= due:
+                        pydirectinput.press(key)
+                        periodic_schedule[key] = now_ts + PERIODIC_ACTIONS[key]
 
+            # --- PHASE 1: OBSERVATION AND DECISION ---
             # Single call to get both player coordinates and climbing state
             coords, is_climbing = get_player_state(sct)
             
@@ -491,37 +594,85 @@ with mss() as sct:
             notices = []#detect_notices(sct)
             bars = {}#detect_bars(sct)
             bars_summary = {cat: items[0]["text"] for cat, items in bars.items() if items}
-            captured = np.array(sct.grab(SCREEN))
-            display_frame = cv2.cvtColor(captured, cv2.COLOR_BGRA2BGR)
-
+            
             # Check HP and MP status
             need_hp = check_hp_status(sct)
             need_mp = check_mp_status(sct)
 
-            # Detect damage
-            damage_count = detect_damage(sct)
+            # Get state vector from current observations
+            state_vector = rl_agent.get_state_vector(
+                coords, monsters, climbs, is_climbing, 
+                need_hp, need_mp, current_actions, 0  # Don't use damage_count yet
+            )
 
-            # Decide and perform the next action
-            next_actions = decide_action(coords, monsters, climbs, is_climbing, need_hp, need_mp)
-            current_actions = perform_action(next_actions, current_actions)
+            if observe_human:
+                pressed = key_tracker.get_held_keys()
+                action_idx = action_idx_from_pressed_keys(pressed)
+                current_actions = action_idx_to_key_sequence(action_idx)
+            else:
+                # Use RL agent to decide action and execute
+                action_idx, current_actions, action_probs, state_value = perform_action_rl(
+                    rl_agent, rl_env, state_vector, current_actions, 0, training=True
+                )
+            
+            # --- PHASE 2: ACTION EXECUTION ---
+            # Action is already executed in perform_action_rl, now wait for results
+            time.sleep(random.uniform(SLEEP_MIN_SECONDS, SLEEP_MAX_SECONDS))
+            
+            # --- PHASE 3: RESULT PARSING ---
+            # After sleep, capture the screen to see the results of our action
+            captured = np.array(sct.grab(SCREEN))
+            display_frame = cv2.cvtColor(captured, cv2.COLOR_BGRA2BGR)
+            
+            # Detect damage that resulted from our action
+            damage_count, damage_positions = detect_damage(sct)
+
+            # Re-sample state after the action for next-state learning
+            coords_next, is_climbing_next = get_player_state(sct)
+            monsters_next = detect_monsters(sct)
+            climbs_next = detect_climbing_objects(sct)
+            need_hp_next = check_hp_status(sct)
+            need_mp_next = check_mp_status(sct)
+            next_state_vector = rl_agent.get_state_vector(
+                coords_next, monsters_next, climbs_next, is_climbing_next,
+                need_hp_next, need_mp_next, current_actions, damage_count
+            )
+            
+            # Compute reward from the observed results
+            reward = rl_env.compute_reward(damage_count, need_hp_next, need_mp_next)
+            episode_reward += reward
+            
+            # Store transition in memory
+            rl_agent.store_transition(state_vector, action_idx, reward, next_state_vector, done=False)
+            
+            total_steps += 1
+            
+            # Update network periodically
+            if total_steps % update_interval == 0:
+                loss = rl_agent.update()
+                print(f"[UPDATE] Steps: {total_steps} | Loss: {loss:.4f} | Episode Reward: {episode_reward:.2f}")
+                rl_env.reset()
+                episode_reward = 0
+                episode_count += 1
 
             coord_str = f"{'Climbing ' if is_climbing else ''}({coords[0]}, {coords[1]})" if coords else "Not Found"
             print(
                 f"Time: {time.strftime('%H:%M:%S')} | Char: {coord_str} | "
-                f"Monsters: {len(monsters)} | Damage: {damage_count} | Notices: {notices} | Bars: {bars_summary} | Action: {current_actions}"
+                f"Monsters: {len(monsters)} | Climbs: {len(climbs_next)} | Damage: {damage_count} | Reward: {reward:.3f} | Action: {current_actions}"
             )
 
-            annotated = annotate_frame(display_frame, coords, monsters, bars)
+            annotated = annotate_frame(display_frame, coords, monsters, bars, climbs_next, damage_positions)
 
             window_rect = cv2.getWindowImageRect(WINDOW_NAME)
             cv2.imshow(WINDOW_NAME, annotated)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
 
-            time.sleep(random.uniform(0.03, 0.10))
-
     except KeyboardInterrupt:
         print("\nStopping Agent.")
+        print(f"Total steps: {total_steps} | Total episodes: {episode_count}")
+        # Save the trained model
+        rl_agent.save_model("rl_agent_model.pth")
     finally:
         # Ensure all keys are released on exit
         for key in ACTIONS:
