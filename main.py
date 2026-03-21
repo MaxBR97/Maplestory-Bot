@@ -16,7 +16,14 @@ SCREEN = {"top": 0, "left": 0, "width": 800, "height": 625}
 BAR_REGION = {"top": 590, "left": 0, "width": 560, "height": 35}
 NOTICE_REGION = {"top": 370, "left": 500, "width": 300, "height": 110}
 
-ACTIONS = ['left', 'right', 'up', 'down', 'alt', 'ctrl','idle', 'space', 'Home', 'End']
+ATTACK_KEYS = {'ctrl', 'space'} # Define all possible attack keys here
+HP_POTION_KEY = 'Page Up'
+MP_POTION_KEY = 'Insert'
+HP_CONSUME_THRESHOLD_PERCENT = 20.0
+MP_CONSUME_THRESHOLD_PERCENT = 70.0
+HP_BAR_REGION = {"top": 615, "left": 220, "width": 100, "height": 4}
+MP_BAR_REGION = {"top": 615, "left": 327, "width": 100, "height": 4}
+ACTIONS = list(dict.fromkeys(['left', 'right', 'up', 'down', 'alt', 'idle'] + list(ATTACK_KEYS) + [HP_POTION_KEY, MP_POTION_KEY]))
 CHARACTER_TEMPLATES_DIR = Path("objects/My_Character")
 CHARACTER_CLIMBING_TEMPLATES_DIR = Path("objects/My_Character/Climbing") # New
 MONSTER_TEMPLATES_DIR = Path("Objects/Monsters")
@@ -26,7 +33,6 @@ MONSTER_MATCH_THRESHOLD = 0.65
 CHARACTER_MATCH_THRESHOLD = 0.65
 ATTACK_RANGE_X = 250
 ATTACK_RANGE_Y = 80 # Vertical distance to engage monsters
-ATTACK_KEYS = {'ctrl', 'space'} # Define all possible attack keys here
 WINDOW_NAME = "MapleStory Detections"
 NOTICE_TEMPLATES_DIR = Path("Objects/Notice")
 NOTICE_MATCH_THRESHOLD = 0.4
@@ -41,7 +47,7 @@ BAR_PATTERNS = {
     "EXP": re.compile(r"(\d+(?:\.\d+)?)"),
 }
 
-PERIODIC_ACTIONS = {"0": 180}  # key -> interval in seconds
+PERIODIC_ACTIONS = {"8": 299, 'c' : 34, 'v' : 32, 'b' : 30}  # key -> interval in seconds
 
 def load_player_templates(base_dir, climbing_dir):
     """Loads all player templates and tags them as climbing or not."""
@@ -95,46 +101,49 @@ BAR_TEMPLATES = {
 MONSTER_TEMPLATES = load_templates_recursive(MONSTER_TEMPLATES_DIR)
 CLIMBING_TEMPLATES = load_templates_recursive(CLIMBING_TEMPLATES_DIR) # New
 
-def check_hp_status(sct):
-    """Checks a single pixel to see if HP is low (grey) or high (red)."""
-    # Define the single pixel region to check
-    hp_pixel_region = {"top": 615, "left": 270, "width": 1, "height": 1}
-    
-    # Grab the pixel
-    img = np.array(sct.grab(hp_pixel_region))
-    
-    # Convert from BGRA to BGR, then to HSV
+def _bar_fill_percent(sct, region, bar_type):
+    """Estimates bar fill percent (0-100) from a horizontal HP/MP bar region."""
+    img = np.array(sct.grab(region))
     bgr_img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    hsv_pixel = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)[0, 0]
-    
-    hue, saturation, value = hsv_pixel
-    
-    # Grey colors have very low saturation.
-    # If saturation is low, we assume the bar is depleted.
-    is_grey = saturation < 30 and value > 50
-    
-    # As requested: returns True if grey (HP needed), False if red.
-    return is_grey
+    hsv_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+
+    if bar_type == "hp":
+        lower_red_1 = np.array([0, 70, 50], dtype=np.uint8)
+        upper_red_1 = np.array([10, 255, 255], dtype=np.uint8)
+        lower_red_2 = np.array([170, 70, 50], dtype=np.uint8)
+        upper_red_2 = np.array([180, 255, 255], dtype=np.uint8)
+        mask = cv2.bitwise_or(
+            cv2.inRange(hsv_img, lower_red_1, upper_red_1),
+            cv2.inRange(hsv_img, lower_red_2, upper_red_2),
+        )
+    else:
+        lower_blue = np.array([90, 70, 40], dtype=np.uint8)
+        upper_blue = np.array([130, 255, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv_img, lower_blue, upper_blue)
+
+    column_color_ratio = (mask > 0).mean(axis=0)
+    colored_columns = np.where(column_color_ratio > 0.25)[0]
+
+    if len(colored_columns) == 0:
+        return 0.0
+
+    rightmost_filled_idx = int(colored_columns.max())
+    fill_percent = ((rightmost_filled_idx + 1) / region["width"]) * 100.0
+    return float(np.clip(fill_percent, 0.0, 100.0))
+
+
+def check_hp_status(sct):
+    """Returns (need_hp, hp_percent) based on the configured HP threshold."""
+    hp_percent = _bar_fill_percent(sct, HP_BAR_REGION, "hp")
+    need_hp = hp_percent < HP_CONSUME_THRESHOLD_PERCENT
+    return need_hp, hp_percent
+
 
 def check_mp_status(sct):
-    """Checks a single pixel to see if MP is low (grey) or high (blue)."""
-    # Define the single pixel region to check
-    mp_pixel_region = {"top": 615, "left": 350, "width": 1, "height": 1}
-    
-    # Grab the pixel
-    img = np.array(sct.grab(mp_pixel_region))
-    
-    # Convert from BGRA to BGR, then to HSV
-    bgr_img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    hsv_pixel = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)[0, 0]
-    
-    hue, saturation, value = hsv_pixel
-    
-    # Grey colors have very low saturation.
-    is_grey = saturation < 30 and value > 50
-    
-    # Returns True if grey (MP needed), False if blue.
-    return is_grey
+    """Returns (need_mp, mp_percent) based on the configured MP threshold."""
+    mp_percent = _bar_fill_percent(sct, MP_BAR_REGION, "mp")
+    need_mp = mp_percent < MP_CONSUME_THRESHOLD_PERCENT
+    return need_mp, mp_percent
 
 def get_player_state(sct):
     """
@@ -336,9 +345,9 @@ def detect_bars(sct):
 def decide_action(player_coords, monsters, climbing_objects, is_climbing, need_HP, need_MP):
     """Decides the next set of actions based on game state, including climbing."""
     if need_HP:
-        return ['Home']
+        return [HP_POTION_KEY]
     if need_MP:
-        return ['End']
+        return [MP_POTION_KEY]
 
     if not player_coords or not monsters:
         return ['idle']
@@ -413,12 +422,13 @@ def perform_action(next_actions, current_actions):
         next_actions = random.choice(possible_wandering_actions)
  
     # --- Handle Single-Press Actions (Potions) ---
-    if 'Home' in next_actions or 'End' in next_actions:
+    potion_keys = {HP_POTION_KEY, MP_POTION_KEY}
+    if any(key in potion_keys for key in next_actions):
         for key in current_actions:
             if key != 'idle':
                 pydirectinput.keyUp(key)
         for key in next_actions:
-            if key in ['Home', 'End']:
+            if key in potion_keys:
                 pydirectinput.press(key)
         return ['idle']
 
@@ -494,9 +504,9 @@ with mss() as sct:
             captured = np.array(sct.grab(SCREEN))
             display_frame = cv2.cvtColor(captured, cv2.COLOR_BGRA2BGR)
 
-            # Check HP and MP status
-            need_hp = check_hp_status(sct)
-            need_mp = check_mp_status(sct)
+            # Check HP/MP percent and threshold-based potion needs
+            need_hp, hp_percent = check_hp_status(sct)
+            need_mp, mp_percent = check_mp_status(sct)
 
             # Detect damage
             damage_count = detect_damage(sct)
@@ -508,6 +518,8 @@ with mss() as sct:
             coord_str = f"{'Climbing ' if is_climbing else ''}({coords[0]}, {coords[1]})" if coords else "Not Found"
             print(
                 f"Time: {time.strftime('%H:%M:%S')} | Char: {coord_str} | "
+                f"HP: {hp_percent:.1f}% (<= {HP_CONSUME_THRESHOLD_PERCENT:.0f}%: {need_hp}) | "
+                f"MP: {mp_percent:.1f}% (<= {MP_CONSUME_THRESHOLD_PERCENT:.0f}%: {need_mp}) | "
                 f"Monsters: {len(monsters)} | Damage: {damage_count} | Notices: {notices} | Bars: {bars_summary} | Action: {current_actions}"
             )
 

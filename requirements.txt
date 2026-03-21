@@ -1,7 +1,0 @@
-opencv-python
-numpy
-pydirectinput
-mss
-easyocr
-torch
-keyboard
