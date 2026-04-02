@@ -47,7 +47,7 @@ BAR_PATTERNS = {
     "EXP": re.compile(r"(\d+(?:\.\d+)?)"),
 }
 
-PERIODIC_ACTIONS = {"8": 299, 'c' : 34, 'v' : 32, 'b' : 30}  # key -> interval in seconds
+PERIODIC_ACTIONS = {"8": 299, 'c' : 101, 'v' : 91, 'b' : 103}  # key -> interval in seconds
 
 def load_player_templates(base_dir, climbing_dir):
     """Loads all player templates and tags them as climbing or not."""
