@@ -177,15 +177,28 @@ When extending this project:
 All three modes use the same profile-local model lifecycle.
 
 ## Reward policy priorities
-- Survival has highest priority and outweighs all other objectives.
-- Killing speed and damage throughput are optimized after survival.
-- Buff lateness penalty must be linear over time:
+- Damage signal refers to **damage done to monsters by the player** (`damage_count`), not damage taken by the player.
+- No explicit kill reward is used (kills are not directly detected yet).
+- No step-alive bonus or global survival scalar is used.
+- Low HP/MP penalties are threshold-gated via parser flags (`need_hp`, `need_mp`), which are derived from:
+  - `hp_consume_threshold_percent`
+  - `mp_consume_threshold_percent`
+- Reward term signs are controlled entirely by config values (positive/negative), not hardcoded by runtime semantics.
+- Buff lateness contribution is linear over time:
 
 $$
 penalty_{buff} = \lambda \cdot \max(0, \Delta t)
 $$
 
 where $\Delta t$ is delay past the scheduled buff time.
+
+Current reward-related keys in profile `hyperparameters.json`:
+- `reward_damage_to_monsters_weight`
+- `low_hp_penalty`
+- `low_mp_penalty`
+- `reward_idle_penalty`
+- `reward_buff_lateness_weight`
+- `reward_no_player_penalty`
 
 ## Hyperparameter policy
 - Keep hyperparameters easy to tune in profile-local config files.

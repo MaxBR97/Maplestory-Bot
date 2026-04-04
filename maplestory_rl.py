@@ -27,15 +27,12 @@ class HyperParameters:
 	epsilon: float = 0.10
 	learning_rate_supervised: float = 0.02
 	learning_rate_online: float = 0.005
-	reward_survival_weight: float = 3.0
-	reward_kill_weight: float = 1.0
-	reward_damage_taken_weight: float = 1.5
-	reward_hp_safety_weight: float = 1.2
-	reward_mp_safety_weight: float = 0.2
+	reward_damage_to_monsters_weight: float = 1.5
+	low_hp_penalty: float = -1.2
+	low_mp_penalty: float = -0.2
 	reward_idle_penalty: float = 0.03
 	reward_buff_lateness_weight: float = 0.04
 	reward_no_player_penalty: float = 0.5
-	reward_step_alive_bonus: float = 0.05
 	max_monster_norm: float = 40.0
 	max_damage_norm: float = 15.0
 
@@ -313,6 +310,8 @@ def load_or_create_hparams(config_path: Path) -> HyperParameters:
 	if config_path.exists():
 		try:
 			raw = json.loads(config_path.read_text(encoding="utf-8"))
+			if not isinstance(raw, dict):
+				raw = {}
 			merged = asdict(defaults)
 			merged.update({k: v for k, v in raw.items() if k in merged})
 			return HyperParameters(**merged)
@@ -366,9 +365,6 @@ def encode_observation(
 	need_mp = 1.0 if memory.need_mp else 0.0
 
 	damage_norm = min(1.0, memory.damage_count / max(1.0, hparams.max_damage_norm))
-	prev_damage = previous_memory.damage_count if previous_memory else 0
-	damage_delta = float(max(0, memory.damage_count - prev_damage))
-	damage_delta_norm = min(1.0, damage_delta / max(1.0, hparams.max_damage_norm))
 
 	lateness_total = 0.0
 	for due in buff_schedule.values():
@@ -401,7 +397,6 @@ def encode_observation(
 			need_hp,
 			need_mp,
 			damage_norm,
-			damage_delta_norm,
 			buff_lateness_norm,
 			phase_sin,
 			phase_cos,
@@ -419,26 +414,18 @@ def compute_reward(
 	now_ts: float,
 	hparams: HyperParameters,
 ) -> float:
+	_ = previous_memory
 	reward = 0.0
-	reward += hparams.reward_step_alive_bonus * hparams.reward_survival_weight
-
-	hp_ratio = float(memory.hp_percent / 100.0)
-	mp_ratio = float(memory.mp_percent / 100.0)
-	reward += hparams.reward_hp_safety_weight * hp_ratio * hparams.reward_survival_weight
-	reward += hparams.reward_mp_safety_weight * mp_ratio
 
 	if memory.need_hp:
-		reward += hparams.reward_survival_weight
+		reward += hparams.low_hp_penalty
 	if memory.need_mp:
-		reward += 0.2
+		reward += hparams.low_mp_penalty
 
 	if memory.player is None:
-		reward += hparams.reward_no_player_penalty * hparams.reward_survival_weight
+		reward += hparams.reward_no_player_penalty
 
-	previous_damage = previous_memory.damage_count if previous_memory else 0
-	damage_delta = max(0, memory.damage_count - previous_damage)
-	reward += hparams.reward_kill_weight * min(2.0, 0.2 * damage_delta)
-	reward += hparams.reward_damage_taken_weight * min(2.0, 0.1 * damage_delta)
+	reward += hparams.reward_damage_to_monsters_weight * float(memory.damage_count)
 
 	if action_stack == [mparse.IDLE_ACTION]:
 		reward += hparams.reward_idle_penalty
@@ -545,7 +532,7 @@ def _draw_debug_panel(
 
 	lines = [
 		f"mode={config.mode} step={stats.steps} reward={reward:.3f}",
-		f"hp={memory.hp_percent:.1f}% mp={memory.mp_percent:.1f}% dmg={memory.damage_count}",
+		f"hp={memory.hp_percent:.1f}% mp={memory.mp_percent:.1f}% dmg_to_monsters={memory.damage_count}",
 		f"player={'yes' if memory.player else 'no'} monsters={len(memory.monsters)} climbs={len(memory.climbing_objects)}",
 		f"action={action_stack}",
 	]
@@ -589,7 +576,15 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 		if cli_value != default_value:
 			merged_values[key] = cli_value
 	hparams = HyperParameters(**merged_values)
-	persisted_hparams = dict(raw_hparams)
+	persisted_hparams: Dict[str, Any] = {}
+	for parser_threshold_key in (
+		"MONSTER_MATCH_THRESHOLD",
+		"CHARACTER_MATCH_THRESHOLD",
+		"CLIMBING_MATCH_THRESHOLD",
+		"DAMAGE_THRESHOLD",
+	):
+		if parser_threshold_key in raw_hparams:
+			persisted_hparams[parser_threshold_key] = raw_hparams[parser_threshold_key]
 	persisted_hparams.update(asdict(hparams))
 	persisted_hparams.setdefault("MONSTER_MATCH_THRESHOLD", mparse.MONSTER_MATCH_THRESHOLD)
 	persisted_hparams.setdefault("CHARACTER_MATCH_THRESHOLD", mparse.CHARACTER_MATCH_THRESHOLD)
@@ -629,7 +624,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 					policy=policy,
 					action_templates=action_templates,
 					hparams=hparams,
-					max_rows=2000,
+					max_rows=90000,
 				)
 				if replay_updates > 0:
 					policy.save(checkpoint_path, action_templates)
@@ -689,7 +684,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 									f"need_mp={memory.need_mp}",
 									f"monsters={len(memory.monsters)}",
 									f"climbs={len(memory.climbing_objects)}",
-									f"damage={memory.damage_count}",
+									f"damage_to_monsters={memory.damage_count}",
 								]
 							)
 						)
@@ -734,7 +729,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 									f"need_mp={memory.need_mp}",
 									f"monsters={len(memory.monsters)}",
 									f"climbs={len(memory.climbing_objects)}",
-									f"damage={memory.damage_count}",
+									f"damage_to_monsters={memory.damage_count}",
 								]
 							)
 						)
@@ -798,8 +793,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--epsilon", type=float, default=None)
 	parser.add_argument("--learning-rate-supervised", type=float, default=None)
 	parser.add_argument("--learning-rate-online", type=float, default=None)
-	parser.add_argument("--reward-survival-weight", type=float, default=None)
-	parser.add_argument("--reward-kill-weight", type=float, default=None)
+	parser.add_argument("--reward-damage-to-monsters-weight", type=float, default=None)
+	parser.add_argument("--low-hp-penalty", type=float, default=None)
+	parser.add_argument("--low-mp-penalty", type=float, default=None)
 	parser.add_argument("--reward-buff-lateness-weight", type=float, default=None)
 	parser.add_argument("--debug", action="store_true")
 	parser.add_argument("--debug-print-every-steps", type=int, default=1)
@@ -825,10 +821,12 @@ def config_from_args(args: argparse.Namespace) -> RLConfig:
 		hparams.learning_rate_supervised = float(args.learning_rate_supervised)
 	if args.learning_rate_online is not None:
 		hparams.learning_rate_online = float(args.learning_rate_online)
-	if args.reward_survival_weight is not None:
-		hparams.reward_survival_weight = float(args.reward_survival_weight)
-	if args.reward_kill_weight is not None:
-		hparams.reward_kill_weight = float(args.reward_kill_weight)
+	if args.reward_damage_to_monsters_weight is not None:
+		hparams.reward_damage_to_monsters_weight = float(args.reward_damage_to_monsters_weight)
+	if args.low_hp_penalty is not None:
+		hparams.low_hp_penalty = float(args.low_hp_penalty)
+	if args.low_mp_penalty is not None:
+		hparams.low_mp_penalty = float(args.low_mp_penalty)
 	if args.reward_buff_lateness_weight is not None:
 		hparams.reward_buff_lateness_weight = float(args.reward_buff_lateness_weight)
 	config.hparams = hparams
