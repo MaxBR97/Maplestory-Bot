@@ -43,6 +43,7 @@ class RLConfig:
 	profile_name: str = mparse.ACTIVE_PROFILE_NAME
 	tick_seconds: float = 0.08
 	max_steps: int = 0
+	sequence_window: int = 1
 	include_damage: bool = True
 	save_every_steps: int = 50
 	checkpoint_name: str = DEFAULT_CHECKPOINT_NAME
@@ -444,18 +445,36 @@ def append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
 		handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def stack_observation_window(observations: Sequence[np.ndarray], window_size: int) -> np.ndarray:
+	if not observations:
+		raise ValueError("observations must not be empty")
+	window_size = max(1, int(window_size))
+	latest = np.asarray(observations[-1], dtype=np.float32)
+	if window_size == 1:
+		return latest
+
+	window_obs: List[np.ndarray] = [np.asarray(obs, dtype=np.float32) for obs in observations[-window_size:]]
+	if len(window_obs) < window_size:
+		padding = [window_obs[0]] * (window_size - len(window_obs))
+		window_obs = padding + window_obs
+	return np.concatenate(window_obs, axis=0).astype(np.float32)
+
+
 def replay_dataset_supervised(
 	dataset_path: Path,
 	policy: LinearPolicyModel,
 	action_templates: Sequence[List[str]],
 	hparams: HyperParameters,
+	sequence_window: int = 1,
 	max_rows: int = 5000,
 ) -> int:
 	if not dataset_path.exists():
 		return 0
 
+	sequence_window = max(1, int(sequence_window))
 	action_index_by_template = {json.dumps(template): index for index, template in enumerate(action_templates)}
 	updates = 0
+	observation_history: List[np.ndarray] = []
 	with dataset_path.open("r", encoding="utf-8") as handle:
 		for index, line in enumerate(handle):
 			if index >= max_rows:
@@ -466,11 +485,15 @@ def replay_dataset_supervised(
 			try:
 				row = json.loads(line)
 				observation = np.array(row["observation"], dtype=np.float32)
+				observation_history.append(observation)
+				if len(observation_history) > sequence_window:
+					observation_history = observation_history[-sequence_window:]
+				stacked_observation = stack_observation_window(observation_history, sequence_window)
 				template_key = json.dumps(mparse.normalize_action_stack(row["action"]))
 				action_index = action_index_by_template.get(template_key)
 				if action_index is None:
 					continue
-				policy.update_supervised(observation, action_index, hparams.learning_rate_supervised)
+				policy.update_supervised(stacked_observation, action_index, hparams.learning_rate_supervised)
 				updates += 1
 			except Exception:
 				continue
@@ -616,7 +639,8 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 		with mss() as sct:
 			warmup_memory = mparse.detect_all(sct, include_damage=config.include_damage)
 			warmup_obs = encode_observation(warmup_memory, None, buff_schedule, time.time(), hparams)
-			policy, action_templates = resolve_or_create_policy(checkpoint_path, len(warmup_obs), action_templates)
+			policy_input_dim = len(warmup_obs) * max(1, int(config.sequence_window))
+			policy, action_templates = resolve_or_create_policy(checkpoint_path, policy_input_dim, action_templates)
 
 			if config.mode in {"inference", "online_train"} and dataset_path.exists():
 				replay_updates = replay_dataset_supervised(
@@ -624,16 +648,22 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 					policy=policy,
 					action_templates=action_templates,
 					hparams=hparams,
+					sequence_window=config.sequence_window,
 					max_rows=90000,
 				)
 				if replay_updates > 0:
 					policy.save(checkpoint_path, action_templates)
 
 			previous_memory: Optional[DetectionMemory] = None
+			recent_observations: List[np.ndarray] = [warmup_obs]
 			while True:
 				now_ts = time.time()
 				memory = mparse.detect_all(sct, memory=None, include_damage=config.include_damage)
 				observation = encode_observation(memory, previous_memory, buff_schedule, now_ts, hparams)
+				recent_observations.append(observation)
+				if len(recent_observations) > max(1, int(config.sequence_window)):
+					recent_observations = recent_observations[-max(1, int(config.sequence_window)):]
+				stacked_observation = stack_observation_window(recent_observations, config.sequence_window)
 				reward = 0.0
 
 				if config.mode == "imitation_collect":
@@ -658,6 +688,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 							"hp_percent": memory.hp_percent,
 							"mp_percent": memory.mp_percent,
 							"monster_count": len(memory.monsters),
+							"damage_count": memory.damage_count,
 						},
 					)
 
@@ -667,7 +698,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 					}
 					action_index = action_index_lookup.get(action_key)
 					if action_index is not None:
-						policy.update_supervised(observation, action_index, hparams.learning_rate_supervised)
+						policy.update_supervised(stacked_observation, action_index, hparams.learning_rate_supervised)
 						stats.supervised_updates += 1
 
 					if config.debug and (stats.steps % max(1, config.debug_print_every_steps) == 0):
@@ -696,7 +727,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 							buff_schedule[buff_key] = now_ts + float(interval)
 
 					epsilon = hparams.epsilon if config.mode == "online_train" else 0.0
-					action_index = policy.predict_action(observation, epsilon=epsilon)
+					action_index = policy.predict_action(stacked_observation, epsilon=epsilon)
 					action_stack = action_templates[action_index]
 					action_executor.apply_action_stack(action_stack)
 
@@ -712,7 +743,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 					stats.last_reward = reward
 
 					if config.mode == "online_train":
-						policy.update_reinforce(observation, action_index, reward, hparams.learning_rate_online)
+						policy.update_reinforce(stacked_observation, action_index, reward, hparams.learning_rate_online)
 						stats.online_updates += 1
 
 					if config.debug and (stats.steps % max(1, config.debug_print_every_steps) == 0):
@@ -787,6 +818,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--profile", default=mparse.ACTIVE_PROFILE_NAME)
 	parser.add_argument("--tick-seconds", type=float, default=0.08)
 	parser.add_argument("--max-steps", type=int, default=0)
+	parser.add_argument("--sequence-window", type=int, default=1)
 	parser.add_argument("--save-every-steps", type=int, default=50)
 	parser.add_argument("--checkpoint-name", type=str, default=DEFAULT_CHECKPOINT_NAME)
 	parser.add_argument("--include-damage", action=argparse.BooleanOptionalAction, default=True)
@@ -808,6 +840,7 @@ def config_from_args(args: argparse.Namespace) -> RLConfig:
 		profile_name=args.profile,
 		tick_seconds=args.tick_seconds,
 		max_steps=args.max_steps,
+		sequence_window=max(1, int(args.sequence_window)),
 		save_every_steps=args.save_every_steps,
 		checkpoint_name=args.checkpoint_name,
 		include_damage=bool(args.include_damage),

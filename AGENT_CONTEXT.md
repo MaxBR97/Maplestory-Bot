@@ -176,6 +176,25 @@ When extending this project:
 
 All three modes use the same profile-local model lifecycle.
 
+## Sequence window support (implemented)
+`maplestory_rl.py` now supports temporal observation stacking via CLI flag:
+
+- `--sequence-window N` (default `1`)
+
+Behavior details:
+- `N=1` preserves previous behavior (single-frame observation; backward-compatible).
+- `N>1` concatenates the most recent `N` encoded observations into one model input vector.
+- Early ticks are left-padded with the earliest available observation until a full window is available.
+- Supervised replay from `imitation_trajectories.jsonl` also uses the same windowing logic, preserving row order.
+- In online loop (`inference` / `online_train`), prediction and policy updates both consume stacked observations.
+
+Checkpoint compatibility:
+- Effective policy input dimension becomes `base_observation_dim * sequence_window`.
+- If an existing checkpoint input dimension does not match the active sequence window setting, runtime initializes a fresh model for the current shape.
+
+Operational note:
+- Keep `--sequence-window` consistent between runs when you want to continue training from the same checkpoint without model reinitialization.
+
 ## Reward policy priorities
 - Damage signal refers to **damage done to monsters by the player** (`damage_count`), not damage taken by the player.
 - No explicit kill reward is used (kills are not directly detected yet).
