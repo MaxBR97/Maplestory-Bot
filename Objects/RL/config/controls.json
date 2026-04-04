@@ -1,0 +1,55 @@
+{
+  "movement_keys": [
+    "left",
+    "right",
+    "up",
+    "down",
+    "alt"
+  ],
+  "attack_keys": [
+    "ctrl",
+    "space"
+  ],
+  "attack_metadata": [
+    {
+      "key": "ctrl",
+      "name": "ctrl",
+      "x_attack_range": 250,
+      "y_attack_range": 80,
+      "minimum_x_attack_range": 0,
+      "is_at_one_direction": true,
+      "number_of_monsters": 1
+    },
+    {
+      "key": "space",
+      "name": "space",
+      "x_attack_range": 250,
+      "y_attack_range": 80,
+      "minimum_x_attack_range": 0,
+      "is_at_one_direction": true,
+      "number_of_monsters": 1
+    }
+  ],
+  "hp_potion_key": "Page Up",
+  "mp_potion_key": "Insert",
+  "hp_consume_threshold_percent": 50.0,
+  "mp_consume_threshold_percent": 50.0,
+  "buffs": [
+    {
+      "key": "8",
+      "interval_seconds": 299
+    },
+    {
+      "key": "c",
+      "interval_seconds": 101
+    },
+    {
+      "key": "v",
+      "interval_seconds": 91
+    },
+    {
+      "key": "b",
+      "interval_seconds": 103
+    }
+  ]
+}

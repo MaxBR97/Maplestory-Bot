@@ -1,0 +1,20 @@
+{
+  "MONSTER_MATCH_THRESHOLD": 0.65,
+  "CHARACTER_MATCH_THRESHOLD": 0.65,
+  "CLIMBING_MATCH_THRESHOLD": 0.7,
+  "DAMAGE_THRESHOLD": 0.58,
+  "epsilon": 0.1,
+  "learning_rate_supervised": 0.5,
+  "learning_rate_online": 0.1,
+  "reward_survival_weight": 1.0,
+  "reward_kill_weight": 0,
+  "reward_damage_taken_weight": 0.5,
+  "reward_hp_safety_weight": 0.2,
+  "reward_mp_safety_weight": 0.01,
+  "reward_idle_penalty": -2.0,
+  "reward_buff_lateness_weight": -0.04,
+  "reward_no_player_penalty": 0,
+  "reward_step_alive_bonus": -0.05,
+  "max_monster_norm": 12.0,
+  "max_damage_norm": 7.0
+}
