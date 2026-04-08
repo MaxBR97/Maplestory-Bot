@@ -926,10 +926,14 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 						print(debug_timer.format_report(stats.steps, timing_report_labels))
 					break
 
-				sleep_seconds = max(0.0, config.tick_seconds)
-				sleep_started_at = time.perf_counter()
-				time.sleep(sleep_seconds)
-				debug_timer.add_seconds("sleep_ms", time.perf_counter() - sleep_started_at)
+				elapsed_before_sleep = time.perf_counter() - tick_started_at
+				remaining_sleep_seconds = max(0.0, float(config.tick_seconds) - elapsed_before_sleep)
+				if remaining_sleep_seconds > 0.0:
+					sleep_started_at = time.perf_counter()
+					time.sleep(remaining_sleep_seconds)
+					debug_timer.add_seconds("sleep_ms", time.perf_counter() - sleep_started_at)
+				else:
+					debug_timer.add_ms("sleep_ms", 0.0)
 				debug_timer.add_seconds("tick_total_ms", time.perf_counter() - tick_started_at)
 				if debug_timer.should_report(stats.steps):
 					print(debug_timer.format_report(stats.steps, timing_report_labels))
