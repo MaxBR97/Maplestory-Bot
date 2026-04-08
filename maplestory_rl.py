@@ -27,6 +27,7 @@ class HyperParameters:
 	epsilon: float = 0.10
 	learning_rate_supervised: float = 0.02
 	learning_rate_online: float = 0.005
+	sequence_window: int = 1
 	reward_damage_to_monsters_weight: float = 1.5
 	low_hp_penalty: float = -1.2
 	low_mp_penalty: float = -0.2
@@ -43,7 +44,6 @@ class RLConfig:
 	profile_name: str = mparse.ACTIVE_PROFILE_NAME
 	tick_seconds: float = 0.08
 	max_steps: int = 0
-	sequence_window: int = 1
 	include_damage: bool = True
 	save_every_steps: int = 50
 	checkpoint_name: str = DEFAULT_CHECKPOINT_NAME
@@ -615,6 +615,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 	persisted_hparams.setdefault("DAMAGE_THRESHOLD", mparse.DAMAGE_THRESHOLD)
 	hparams_path.write_text(json.dumps(persisted_hparams, indent=2), encoding="utf-8")
 	config.hparams = hparams
+	sequence_window = max(1, int(getattr(hparams, "sequence_window", 1)))
 
 	checkpoint_path = profile_paths["rl_checkpoints_dir"] / config.checkpoint_name
 	dataset_path = profile_paths["rl_datasets_dir"] / DEFAULT_DATASET_FILENAME
@@ -639,7 +640,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 		with mss() as sct:
 			warmup_memory = mparse.detect_all(sct, include_damage=config.include_damage)
 			warmup_obs = encode_observation(warmup_memory, None, buff_schedule, time.time(), hparams)
-			policy_input_dim = len(warmup_obs) * max(1, int(config.sequence_window))
+			policy_input_dim = len(warmup_obs) * sequence_window
 			policy, action_templates = resolve_or_create_policy(checkpoint_path, policy_input_dim, action_templates)
 
 			if config.mode in {"inference", "online_train"} and dataset_path.exists():
@@ -648,7 +649,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 					policy=policy,
 					action_templates=action_templates,
 					hparams=hparams,
-					sequence_window=config.sequence_window,
+					sequence_window=sequence_window,
 					max_rows=90000,
 				)
 				if replay_updates > 0:
@@ -661,9 +662,9 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 				memory = mparse.detect_all(sct, memory=None, include_damage=config.include_damage)
 				observation = encode_observation(memory, previous_memory, buff_schedule, now_ts, hparams)
 				recent_observations.append(observation)
-				if len(recent_observations) > max(1, int(config.sequence_window)):
-					recent_observations = recent_observations[-max(1, int(config.sequence_window)):]
-				stacked_observation = stack_observation_window(recent_observations, config.sequence_window)
+				if len(recent_observations) > sequence_window:
+					recent_observations = recent_observations[-sequence_window:]
+				stacked_observation = stack_observation_window(recent_observations, sequence_window)
 				reward = 0.0
 
 				if config.mode == "imitation_collect":
@@ -818,7 +819,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--profile", default=mparse.ACTIVE_PROFILE_NAME)
 	parser.add_argument("--tick-seconds", type=float, default=0.08)
 	parser.add_argument("--max-steps", type=int, default=0)
-	parser.add_argument("--sequence-window", type=int, default=1)
+	parser.add_argument("--sequence-window", type=int, default=None)
 	parser.add_argument("--save-every-steps", type=int, default=50)
 	parser.add_argument("--checkpoint-name", type=str, default=DEFAULT_CHECKPOINT_NAME)
 	parser.add_argument("--include-damage", action=argparse.BooleanOptionalAction, default=True)
@@ -840,7 +841,6 @@ def config_from_args(args: argparse.Namespace) -> RLConfig:
 		profile_name=args.profile,
 		tick_seconds=args.tick_seconds,
 		max_steps=args.max_steps,
-		sequence_window=max(1, int(args.sequence_window)),
 		save_every_steps=args.save_every_steps,
 		checkpoint_name=args.checkpoint_name,
 		include_damage=bool(args.include_damage),
@@ -848,6 +848,8 @@ def config_from_args(args: argparse.Namespace) -> RLConfig:
 		debug_print_every_steps=max(1, int(args.debug_print_every_steps)),
 	)
 	hparams = HyperParameters()
+	if args.sequence_window is not None:
+		hparams.sequence_window = max(1, int(args.sequence_window))
 	if args.epsilon is not None:
 		hparams.epsilon = float(args.epsilon)
 	if args.learning_rate_supervised is not None:

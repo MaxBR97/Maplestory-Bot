@@ -179,7 +179,8 @@ All three modes use the same profile-local model lifecycle.
 ## Sequence window support (implemented)
 `maplestory_rl.py` now supports temporal observation stacking via CLI flag:
 
-- `--sequence-window N` (default `1`)
+- Source-of-truth: `sequence_window` field in `<P>/RL/config/hyperparameters.json` (default `1` when missing).
+- Optional runtime override: `--sequence-window N`.
 
 Behavior details:
 - `N=1` preserves previous behavior (single-frame observation; backward-compatible).
@@ -193,7 +194,7 @@ Checkpoint compatibility:
 - If an existing checkpoint input dimension does not match the active sequence window setting, runtime initializes a fresh model for the current shape.
 
 Operational note:
-- Keep `--sequence-window` consistent between runs when you want to continue training from the same checkpoint without model reinitialization.
+- Keep effective `sequence_window` consistent between runs when you want to continue training from the same checkpoint without model reinitialization.
 
 ## Reward policy priorities
 - Damage signal refers to **damage done to monsters by the player** (`damage_count`), not damage taken by the player.
