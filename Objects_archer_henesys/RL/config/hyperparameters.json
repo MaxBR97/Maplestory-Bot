@@ -2,7 +2,7 @@
   "MONSTER_MATCH_THRESHOLD": 0.65,
   "CHARACTER_MATCH_THRESHOLD": 0.65,
   "CLIMBING_MATCH_THRESHOLD": 0.7,
-  "DAMAGE_THRESHOLD": 0.69,
+  "DAMAGE_THRESHOLD": 0.58,
   "epsilon": 1.0,
   "learning_rate_supervised": 0.1,
   "learning_rate_online": 0.05,
