@@ -700,10 +700,15 @@ def detect_all(
     sct: Any,
     memory: Optional[DetectionMemory] = None,
     include_damage: bool = True,
+    metrics_ms: Optional[Dict[str, float]] = None,
 ) -> DetectionMemory:
     global CURRENT_MEMORY
 
+    capture_started_at = time.perf_counter()
     bgr, gray = _grab_screen_bgr_gray(sct)
+    capture_elapsed_ms = (time.perf_counter() - capture_started_at) * 1000.0
+    if metrics_ms is not None:
+        metrics_ms["parse_capture_ms"] = float(capture_elapsed_ms)
     height, width = bgr.shape[:2]
 
     mem = memory or new_memory(ACTIVE_PROFILE_NAME)
@@ -711,7 +716,10 @@ def detect_all(
     mem.frame_size = (width, height)
     mem.profile_name = ACTIVE_PROFILE_NAME
 
+    player_started_at = time.perf_counter()
     player_coords, is_climbing, player_score = _get_player_state_from_gray(gray)
+    if metrics_ms is not None:
+        metrics_ms["parse_player_ms"] = float((time.perf_counter() - player_started_at) * 1000.0)
     mem.player = (
         _make_detected_object(
             object_type="player",
@@ -725,22 +733,38 @@ def detect_all(
     )
     mem.is_climbing = is_climbing
 
+    monsters_started_at = time.perf_counter()
     monster_points = _detect_monsters_from_gray(gray)
+    if metrics_ms is not None:
+        metrics_ms["parse_monsters_ms"] = float((time.perf_counter() - monsters_started_at) * 1000.0)
     mem.monsters = [
         _make_detected_object("monster", x=mx, y=my)
         for mx, my in monster_points
     ]
 
+    climbing_started_at = time.perf_counter()
     climbing_points = _detect_climbing_objects_from_gray(gray)
+    if metrics_ms is not None:
+        metrics_ms["parse_climbing_ms"] = float((time.perf_counter() - climbing_started_at) * 1000.0)
     mem.climbing_objects = [
         _make_detected_object("climbing", x=cx, y=cy)
         for cx, cy in climbing_points
     ]
 
+    damage_started_at = time.perf_counter()
     mem.damage_count = _detect_damage_from_gray(gray) if include_damage else 0
+    if metrics_ms is not None:
+        metrics_ms["parse_damage_ms"] = float((time.perf_counter() - damage_started_at) * 1000.0)
 
+    hp_started_at = time.perf_counter()
     need_hp, hp_percent = check_hp_status(sct)
+    if metrics_ms is not None:
+        metrics_ms["parse_hp_bar_ms"] = float((time.perf_counter() - hp_started_at) * 1000.0)
+
+    mp_started_at = time.perf_counter()
     need_mp, mp_percent = check_mp_status(sct)
+    if metrics_ms is not None:
+        metrics_ms["parse_mp_bar_ms"] = float((time.perf_counter() - mp_started_at) * 1000.0)
     mem.need_hp = need_hp
     mem.hp_percent = hp_percent
     mem.need_mp = need_mp

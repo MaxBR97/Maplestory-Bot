@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import time
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -60,6 +61,62 @@ class RuntimeStats:
 	online_updates: int = 0
 	last_reward: float = 0.0
 	started_at: float = 0.0
+
+
+class DebugTimer:
+	def __init__(self, enabled: bool, report_every_steps: int = 20, history_window: int = 120) -> None:
+		self.enabled = bool(enabled)
+		self.report_every_steps = max(1, int(report_every_steps))
+		self.history_window = max(self.report_every_steps, int(history_window))
+		self.current_tick_ms: Dict[str, float] = {}
+		self._history_ms: Dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=self.history_window))
+
+	def reset_tick(self) -> None:
+		if not self.enabled:
+			return
+		self.current_tick_ms = {}
+
+	def add_ms(self, label: str, duration_ms: float) -> None:
+		if not self.enabled:
+			return
+		value = max(0.0, float(duration_ms))
+		self.current_tick_ms[label] = self.current_tick_ms.get(label, 0.0) + value
+		self._history_ms[label].append(value)
+
+	def add_seconds(self, label: str, duration_s: float) -> None:
+		self.add_ms(label, float(duration_s) * 1000.0)
+
+	def capture_from_dict_ms(self, metrics: Dict[str, float]) -> None:
+		if not self.enabled:
+			return
+		for key, value in metrics.items():
+			self.add_ms(key, value)
+
+	def should_report(self, step: int) -> bool:
+		return self.enabled and step > 0 and (step % self.report_every_steps == 0)
+
+	def _avg_ms(self, label: str) -> float:
+		samples = list(self._history_ms.get(label, []))
+		if not samples:
+			return 0.0
+		return float(sum(samples) / len(samples))
+
+	def _p95_ms(self, label: str) -> float:
+		samples = list(self._history_ms.get(label, []))
+		if not samples:
+			return 0.0
+		return float(np.percentile(np.array(samples, dtype=np.float32), 95))
+
+	def format_report(self, step: int, labels: Sequence[str]) -> str:
+		parts: List[str] = [f"[timing] step={step}"]
+		for label in labels:
+			current = self.current_tick_ms.get(label)
+			if current is None:
+				continue
+			avg = self._avg_ms(label)
+			p95 = self._p95_ms(label)
+			parts.append(f"{label}={current:.1f}ms(avg={avg:.1f},p95={p95:.1f})")
+		return " | ".join(parts)
 
 
 class LinearPolicyModel:
@@ -139,6 +196,7 @@ class ActionExecutor:
 		try:
 			import pydirectinput  # type: ignore
 
+			pydirectinput.PAUSE = 0.005
 			self._pydirectinput = pydirectinput
 			self.enabled = True
 		except Exception:
@@ -632,6 +690,31 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 	human_observer = HumanKeyObserver() if mode_requires_keyboard_observer(config.mode) else None
 	action_executor = ActionExecutor()
 	stats = RuntimeStats(started_at=time.time())
+	debug_timer = DebugTimer(enabled=config.debug, report_every_steps=20)
+	timing_report_labels = [
+		"parse_capture_ms",
+		"parse_player_ms",
+		"parse_monsters_ms",
+		"parse_climbing_ms",
+		"parse_damage_ms",
+		"parse_hp_bar_ms",
+		"parse_mp_bar_ms",
+		"capture_parse_total_ms",
+		"state_assembly_ms",
+		"human_input_ms",
+		"dataset_log_ms",
+		"supervised_update_ms",
+		"buff_maintenance_ms",
+		"policy_inference_ms",
+		"action_exec_ms",
+		"reward_ms",
+		"online_update_ms",
+		"run_log_ms",
+		"debug_render_ms",
+		"checkpoint_save_ms",
+		"sleep_ms",
+		"tick_total_ms",
+	]
 	window_name = "MapleStory RL Debug"
 	debug_window_initialized = False
 
@@ -658,16 +741,31 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 			previous_memory: Optional[DetectionMemory] = None
 			recent_observations: List[np.ndarray] = [warmup_obs]
 			while True:
+				tick_started_at = time.perf_counter()
+				debug_timer.reset_tick()
 				now_ts = time.time()
-				memory = mparse.detect_all(sct, memory=None, include_damage=config.include_damage)
+				parse_metrics_ms: Dict[str, float] = {}
+				memory = mparse.detect_all(
+					sct,
+					memory=None,
+					include_damage=config.include_damage,
+					metrics_ms=parse_metrics_ms,
+				)
+				debug_timer.capture_from_dict_ms(parse_metrics_ms)
+				if parse_metrics_ms:
+					debug_timer.add_ms("capture_parse_total_ms", sum(parse_metrics_ms.values()))
+
+				state_started_at = time.perf_counter()
 				observation = encode_observation(memory, previous_memory, buff_schedule, now_ts, hparams)
 				recent_observations.append(observation)
 				if len(recent_observations) > sequence_window:
 					recent_observations = recent_observations[-sequence_window:]
 				stacked_observation = stack_observation_window(recent_observations, sequence_window)
+				debug_timer.add_seconds("state_assembly_ms", time.perf_counter() - state_started_at)
 				reward = 0.0
 
 				if config.mode == "imitation_collect":
+					human_input_started_at = time.perf_counter()
 					action_stack = [mparse.IDLE_ACTION]
 					if human_observer is not None:
 						action_stack = human_observer.get_pressed_action_stack()
@@ -677,7 +775,9 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 								if configured_key == buff_key:
 									buff_schedule[buff_key] = now_ts + float(interval)
 									break
+					debug_timer.add_seconds("human_input_ms", time.perf_counter() - human_input_started_at)
 
+					dataset_log_started_at = time.perf_counter()
 					append_jsonl(
 						dataset_path,
 						{
@@ -692,7 +792,9 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 							"damage_count": memory.damage_count,
 						},
 					)
+					debug_timer.add_seconds("dataset_log_ms", time.perf_counter() - dataset_log_started_at)
 
+					supervised_started_at = time.perf_counter()
 					action_key = json.dumps(mparse.normalize_action_stack(action_stack))
 					action_index_lookup = {
 						json.dumps(template): index for index, template in enumerate(action_templates)
@@ -701,6 +803,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 					if action_index is not None:
 						policy.update_supervised(stacked_observation, action_index, hparams.learning_rate_supervised)
 						stats.supervised_updates += 1
+					debug_timer.add_seconds("supervised_update_ms", time.perf_counter() - supervised_started_at)
 
 					if config.debug and (stats.steps % max(1, config.debug_print_every_steps) == 0):
 						print(
@@ -721,17 +824,25 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 							)
 						)
 				else:
+					buff_maintenance_started_at = time.perf_counter()
 					for buff_key, interval in mparse.BUFF_KEYS:
 						due = buff_schedule.get(buff_key, now_ts + float(interval))
 						if now_ts >= due:
 							action_executor._press(buff_key)
 							buff_schedule[buff_key] = now_ts + float(interval)
+					debug_timer.add_seconds("buff_maintenance_ms", time.perf_counter() - buff_maintenance_started_at)
 
+					inference_started_at = time.perf_counter()
 					epsilon = hparams.epsilon if config.mode == "online_train" else 0.0
 					action_index = policy.predict_action(stacked_observation, epsilon=epsilon)
 					action_stack = action_templates[action_index]
-					action_executor.apply_action_stack(action_stack)
+					debug_timer.add_seconds("policy_inference_ms", time.perf_counter() - inference_started_at)
 
+					action_exec_started_at = time.perf_counter()
+					action_executor.apply_action_stack(action_stack)
+					debug_timer.add_seconds("action_exec_ms", time.perf_counter() - action_exec_started_at)
+
+					reward_started_at = time.perf_counter()
 					reward = compute_reward(
 						memory=memory,
 						previous_memory=previous_memory,
@@ -740,12 +851,15 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 						now_ts=now_ts,
 						hparams=hparams,
 					)
+					debug_timer.add_seconds("reward_ms", time.perf_counter() - reward_started_at)
 					stats.total_reward += reward
 					stats.last_reward = reward
 
 					if config.mode == "online_train":
+						online_update_started_at = time.perf_counter()
 						policy.update_reinforce(stacked_observation, action_index, reward, hparams.learning_rate_online)
 						stats.online_updates += 1
+						debug_timer.add_seconds("online_update_ms", time.perf_counter() - online_update_started_at)
 
 					if config.debug and (stats.steps % max(1, config.debug_print_every_steps) == 0):
 						print(
@@ -766,6 +880,7 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 							)
 						)
 
+					run_log_started_at = time.perf_counter()
 					append_jsonl(
 						run_log_path,
 						{
@@ -780,10 +895,12 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 							"damage_count": memory.damage_count,
 						},
 					)
+					debug_timer.add_seconds("run_log_ms", time.perf_counter() - run_log_started_at)
 
 				stats.steps += 1
 
 				if config.debug:
+					debug_render_started_at = time.perf_counter()
 					if not debug_window_initialized:
 						cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 						cv2.resizeWindow(window_name, 840, 640)
@@ -793,16 +910,29 @@ def run_agent(config: RLConfig) -> RuntimeStats:
 					frame = cv2.cvtColor(captured, cv2.COLOR_BGRA2BGR)
 					panel = _draw_debug_panel(frame, memory, action_stack, config, stats, reward)
 					cv2.imshow(window_name, panel)
+					debug_timer.add_seconds("debug_render_ms", time.perf_counter() - debug_render_started_at)
 					if cv2.waitKey(1) & 0xFF == 27:
 						break
 
 				if stats.steps % max(1, config.save_every_steps) == 0:
+					save_started_at = time.perf_counter()
 					policy.save(checkpoint_path, action_templates)
+					debug_timer.add_seconds("checkpoint_save_ms", time.perf_counter() - save_started_at)
 
 				previous_memory = memory
 				if config.max_steps > 0 and stats.steps >= config.max_steps:
+					debug_timer.add_seconds("tick_total_ms", time.perf_counter() - tick_started_at)
+					if debug_timer.should_report(stats.steps):
+						print(debug_timer.format_report(stats.steps, timing_report_labels))
 					break
-				time.sleep(max(0.0, config.tick_seconds))
+
+				sleep_seconds = max(0.0, config.tick_seconds)
+				sleep_started_at = time.perf_counter()
+				time.sleep(sleep_seconds)
+				debug_timer.add_seconds("sleep_ms", time.perf_counter() - sleep_started_at)
+				debug_timer.add_seconds("tick_total_ms", time.perf_counter() - tick_started_at)
+				if debug_timer.should_report(stats.steps):
+					print(debug_timer.format_report(stats.steps, timing_report_labels))
 	finally:
 		if policy is not None:
 			policy.save(checkpoint_path, action_templates)
